@@ -1,0 +1,96 @@
+# RegesMoE - continuous integration.
+#
+# WHAT THIS RUNS, AND WHY IT IS EXACTLY THAT:
+#   * setup.py's own tests and serve's own tests, because every one of them runs with NO GPU, NO model file
+#     and NO download - they mock the outside world. They are the whole test suite that CI can actually
+#     verify, so they are the whole suite here.
+#   * the GGUF rebrand self-test, which proves the safety guard without a 69 GB model.
+#   * a syntax check of the host-compilable C++ (the loader and geometry layers, which carry the RegesCore
+#     profile) on the stub toolchain.
+#
+# WHAT IT DELIBERATELY DOES NOT RUN: anything needing CUDA. There is no GPU in CI and no kernel change is
+# included, so building the engine here would measure nothing about the thing that is actually unverified
+# (the 2048-wide kernels - see README.md "What does not work yet"). Pretending otherwise would make CI
+# green in a way that says nothing.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  python:
+    name: installer + server tests (no GPU, no model, no download)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # the oldest and the newest Python this supports; setup.py uses `X | None` annotations
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: install
+        run: python -m pip install --upgrade pip pyyaml
+
+      - name: setup.py's own tests
+        run: |
+          python -m unittest discover -s tools -p "test_setup_*.py" -v
+
+      - name: the server and web app's tests
+        # Each file in its OWN process. Two of serve/test_parallel.py's cases measure a blocking step's
+        # announced time allowance, so they are load-sensitive: run all 21 files as one suite on a loaded
+        # machine and they fail on timing while passing 3/3 in isolation and in pairs. Per-file isolation is
+        # what makes this job a signal rather than a coin flip.
+        run: |
+          set -e
+          for f in serve/test_*.py; do
+            echo "--- $f"
+            python -m unittest "serve.$(basename "$f" .py)"
+          done
+
+  rebrand:
+    name: GGUF rebrand safety guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install
+        run: python -m pip install --upgrade pip numpy
+      # Proves: the identity keys are rewritten, the architecture and its namespaced keys and the
+      # vocabulary are NOT, every weight byte survives, and all three dangerous rewrites are refused.
+      - name: selftest
+        run: python tools/reges_rebrand.py selftest
+
+  engine-cpp:
+    name: host C++ (loader + geometry), no CUDA
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq g++
+      # These are the translation units that carry the RegesCore profile. They need no CUDA headers, so
+      # they compile on a plain g++ - which is what makes them worth checking here.
+      - name: compile the geometry/loader layers
+        run: |
+          set -e
+          for f in src/core/layout.cpp src/artifact/gguf_reader.cpp src/kernels/cpu/expert_layout.cpp; do
+            echo "  $f"
+            g++ -std=c++20 -fsyntax-only -I include "$f"
+          done
+
+      - name: the profile test (synthetic GGUF metadata, no model, no GPU)
+        run: |
+          set -e
+          g++ -std=c++20 -O1 -I include -o /tmp/model_profile_test src/core/model_profile_test.cpp
+          /tmp/model_profile_test
