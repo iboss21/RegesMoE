@@ -36,8 +36,11 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
+      # From requirements.txt, not a hand-written list: that file is what setup installs into .venv, so CI
+      # tests the dependency set users actually get. Without jinja2 the whole serve suite fails on IMPORT,
+      # which reads exactly like a failing test and is not one.
       - name: install
-        run: python -m pip install --upgrade pip pyyaml
+        run: python -m pip install --upgrade pip -r requirements.txt
 
       - name: setup.py's own tests
         run: |
